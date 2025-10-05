@@ -12,6 +12,19 @@ from fpdf import FPDF
 import mediapipe as mp
 
 import xstep_core as xstep  # your core pipeline
+import zipfile, joblib, os
+from pathlib import Path
+
+def load_model_zip():
+    model_zip = Path("models/activity_rf.zip")
+    model_pkl = Path("models/activity_rf.pkl")
+
+    if not model_pkl.exists() and model_zip.exists():
+        with zipfile.ZipFile(model_zip, "r") as zf:
+            zf.extractall("models")
+
+    return joblib.load(model_pkl)
+
 
 st.set_page_config(page_title="Xstep – Running Posture Analysis", layout="wide")
 
@@ -988,4 +1001,5 @@ with tab_adv:
         else:
             st.info("No activity rows to plot.")
     else:
+
         st.info("No activity column in CSV.")
