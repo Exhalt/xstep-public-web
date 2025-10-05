@@ -1,4 +1,4 @@
-# app.py
+# app.py (knee-direction flip before processing)
 import os, io, json, tempfile, time, subprocess, base64, re, sys, asyncio, textwrap, urllib.request, hashlib
 from pathlib import Path
 
@@ -6,41 +6,12 @@ import cv2
 import numpy as np
 import pandas as pd
 import streamlit as st
-
-# ✅ MUST be the first Streamlit command
-st.set_page_config(page_title="Xstep – Running Posture Analysis", layout="wide")
-
 import plotly.graph_objects as go
 import plotly.express as px
 from fpdf import FPDF
 import mediapipe as mp
 
 import xstep_core as xstep  # your core pipeline
-
-# --- check model availability on startup ---
-try:
-    test_model = xstep._load_activity_model()
-    if test_model is None:
-        st.info("ℹ️ Running in heuristic mode (model file not found). "
-                "To enable ML detection, set MODEL_URL in Streamlit secrets "
-                "or add models/activity_rf.joblib to the repo.")
-    else:
-        st.success("✅ Activity model loaded successfully.")
-except Exception as e:
-    st.warning(f"⚠️ Could not initialize model: {e}")
-    
-import zipfile, joblib, os
-from pathlib import Path
-
-def load_model_zip():
-    model_zip = Path("models/activity_rf.zip")
-    model_pkl = Path("models/activity_rf.pkl")
-
-    if not model_pkl.exists() and model_zip.exists():
-        with zipfile.ZipFile(model_zip, "r") as zf:
-            zf.extractall("models")
-
-    return joblib.load(model_pkl)
 
 st.set_page_config(page_title="Xstep – Running Posture Analysis", layout="wide")
 
@@ -50,7 +21,7 @@ if sys.platform.startswith("win"):
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     except Exception:
         pass
-        
+
 # ======================= constants & labels =======================
 CATS_NUMERIC = ["shank","foot_strike","foot_pitch","msa","symmetry"]
 CAT_LABEL = {
@@ -1017,8 +988,4 @@ with tab_adv:
         else:
             st.info("No activity rows to plot.")
     else:
-
         st.info("No activity column in CSV.")
-
-
-
