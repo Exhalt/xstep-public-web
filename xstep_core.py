@@ -1,133 +1,16 @@
 """
 Xstep_mediapipe.py
 Running Posture Correction Analysis Script (debounced + min-lap-duration + robust realtime I/O + live summary)
-
 - Anti-spike activity debounce so it doesn't flash "running" at start.
 - Ignores any running/jogging segment shorter than 3 seconds (no summary).
 - Realtime mode: robust camera open on Windows, MP4/AVI writer fallbacks, CSV flush.
 - Live summary: writes a rolling JSON file (live_summary.json) in realtime mode, now with recommendations.
-- Model loader can pull from a GitHub Release/Tag URL (.zip/.pkl/.joblib), caches to .cache_models/,
-       and falls back to local models/ if present.
 
+Author: you + ChatGPT
 """
-
-import os, sys, csv, json, platform, time, io
+import os, sys, csv, json, platform, time
 import cv2
 import numpy as np
-from pathlib import Path
-
-# ---------- Model loader helper ----------
-import joblib, zipfile, requests, gzip
-
-# DEFAULT public URL fallback (used if neither env MODEL_URL nor Streamlit secrets set)
-DEFAULT_MODEL_URL = "https://github.com/Exhalt/xstep-public-web/archive/refs/tags/models.zip"
-
-def _find_model_in_zipfile(zf: zipfile.ZipFile):
-    """
-    Search a ZipFile for a model file. Prefer names that look like activity_rf.*,
-    otherwise take the first *.pkl or *.joblib we see.
-    Returns (name_in_zip, ext) or (None, None).
-    """
-    names = zf.namelist()
-    # Prefer explicit names
-    prefer = [n for n in names if n.lower().endswith((".pkl", ".joblib")) and "activity_rf" in n.lower()]
-    if prefer:
-        name = prefer[0]
-        ext = ".joblib" if name.lower().endswith(".joblib") else ".pkl"
-        return name, ext
-    # Else any model-like file
-    any_model = [n for n in names if n.lower().endswith((".pkl", ".joblib"))]
-    if any_model:
-        name = any_model[0]
-        ext = ".joblib" if name.lower().endswith(".joblib") else ".pkl"
-        return name, ext
-    return None, None
-
-def _safe_joblib_load(path: Path):
-    """Load with joblib and handle both dict pickle ({'model':..., 'labels':[...]}) or pure estimator."""
-    obj = joblib.load(path)
-    return obj
-
-def _load_activity_model():
-    base = Path(__file__).resolve().parent
-    models_dir = base / "models"
-    cache_dir = base / ".cache_models"
-    cache_dir.mkdir(exist_ok=True)
-
-    pkl = models_dir / "activity_rf.pkl"
-    gz  = models_dir / "activity_rf.pkl.gz"
-    zip_path = models_dir / "activity_rf.pkl.zip"
-
-    if pkl.exists():
-        return joblib.load(pkl)
-
-    if gz.exists():
-        with gzip.open(gz, "rb") as f:
-            return joblib.load(f)
-
-    if zip_path.exists():
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            names = [n for n in zf.namelist() if n.endswith(".pkl")]
-            if not names:
-                raise RuntimeError("ZIP has no .pkl inside.")
-            name = names[0]
-            out = cache_dir / Path(name).name
-            if not out.exists():
-                out.write_bytes(zf.read(name))
-            return joblib.load(out)
-
-    # --- 2) Cache folder ---
-    cache_dir = base / ".cache_models"
-    cache_dir.mkdir(exist_ok=True)
-    cache_candidates = [
-        cache_dir / "activity_rf.pkl",
-        cache_dir / "activity_rf.joblib",
-    ]
-    for c in cache_candidates:
-        if c.exists():
-            print("[_load_activity_model] Using cached model:", c.name)
-            return _safe_joblib_load(c)
-
-    # --- 3) URL from Streamlit secrets or env, else DEFAULT_MODEL_URL ---
-    url = os.getenv("MODEL_URL")
-    if not url:
-        try:
-            import streamlit as st  # will work when running inside Streamlit
-            url = st.secrets.get("MODEL_URL")
-        except Exception:
-            url = None
-    if not url:
-        url = DEFAULT_MODEL_URL
-
-    if not url:
-        print("[_load_activity_model] No model URL provided and no local model. Heuristic fallback will be used.")
-        return None
-
-    print(f"[_load_activity_model] Downloading model from: {url}")
-    r = requests.get(url, timeout=180, allow_redirects=True)
-    r.raise_for_status()
-
-    # If it's a zip (GitHub Release asset or GitHub tag archive)
-    if url.lower().endswith(".zip") or "/archive/refs/tags/" in url.lower():
-        ztmp = cache_dir / "downloaded_archive.zip"
-        ztmp.write_bytes(r.content)
-        with zipfile.ZipFile(ztmp, "r") as zf:
-            name, ext = _find_model_in_zipfile(zf)
-            if not name:
-                raise RuntimeError("Downloaded archive contains no *.pkl or *.joblib. Put the model inside the archive.")
-            out_path = cache_dir / f"activity_rf{ext}"
-            with zf.open(name) as f:
-                out_path.write_bytes(f.read())
-        print(f"[_load_activity_model] Extracted model -> {out_path}")
-        return _safe_joblib_load(out_path)
-
-    # Else assume direct model file (.pkl/.joblib)
-    # Try to infer extension; default to .pkl
-    ext = ".joblib" if url.lower().endswith(".joblib") else ".pkl"
-    cache_path = cache_dir / f"activity_rf{ext}"
-    cache_path.write_bytes(r.content)
-    print(f"[_load_activity_model] Saved model -> {cache_path}")
-    return _safe_joblib_load(cache_path)
 
 # Try to import joblib for loading model (if available)
 try:
@@ -287,50 +170,48 @@ def extract_running_features(landmarks, image_w, image_h, prev_state):
 # ---------- Activity detector with debounce ----------
 class RunningDetector:
     """
-    Detects running/jogging vs walking/not_active using a trained model
-    (if available) or a heuristic fallback.
+    Detects running/jogging vs walking/not_active using a trained model (if available) or a heuristic.
+    Adds DEBOUNCE so classification labels don't spike (e.g., show "running" at video start).
     """
     def __init__(self, fps, window_sec=6.0,
-                 anti_spike_to_run_sec=0.75,
-                 anti_spike_to_idle_sec=0.50,
-                 anti_spike_between_run_sec=0.30):
+                 anti_spike_to_run_sec=0.75,   # require this long to promote -> jogging/running
+                 anti_spike_to_idle_sec=0.50,  # require this long to demote -> walking/not_active
+                 anti_spike_between_run_sec=0.30):  # jogging<->running smoothing
         from collections import deque
         self.fps = fps
         self.window = int(max(1, round(window_sec * fps)))
         self.frame_idx = 0
+
+        # Model buffer
         self.model = None
         self.model_labels = []
         self.model_window = int(round(2.0 * fps))
         self.recent_frames = deque(maxlen=self.model_window)
 
+        # Heuristic buffers
         self.left_strikes = deque()
         self.right_strikes = deque()
+
+        # Debounce
         self.stable_state = "not_active"
         self.candidate_state = None
         self.candidate_count = 0
-        self.to_run_frames = max(1, int(round(anti_spike_to_run_sec * fps)))
+
+        self.to_run_frames  = max(1, int(round(anti_spike_to_run_sec * fps)))
         self.to_idle_frames = max(1, int(round(anti_spike_to_idle_sec * fps)))
         self.between_run_frames = max(1, int(round(anti_spike_between_run_sec * fps)))
 
-        # --- unified model loader ---
         if HAVE_JOBLIB:
             try:
-                md = _load_activity_model()
-                if isinstance(md, dict):
-                    self.model = md.get("model")
-                    self.model_labels = md.get("labels", [])
-                else:
-                    self.model = md
-                    self.model_labels = []
-
-                if self.model is None:
-                    print("[RunningDetector] Warning: model empty → heuristic fallback.")
+                md = joblib.load("activity_rf.pkl")
+                self.model = md.get("model", None)
+                self.model_labels = md.get("labels", [])
             except Exception as e:
-                print(f"[RunningDetector] Warning: cannot load model (reason: {e}) → heuristic.")
+                print(f"[RunningDetector] Warning: cannot load activity_rf.pkl -> heuristic (reason: {e})")
                 self.model = None
         else:
-            print("[RunningDetector] joblib not available → heuristic fallback.")
-            
+            print("[RunningDetector] joblib not available -> using heuristic fallback.")
+
     def _trim(self, deq):
         while deq and (self.frame_idx - deq[0] > self.window):
             deq.popleft()
@@ -650,6 +531,7 @@ def build_recommendations(seg_raw, notes=None, posture_counts=None):
         if posture_counts and sum(posture_counts.values()) > 0:
             recs.append("Overall running form looks good – no major issues detected.")
         else:
+            # for realtime partials with zero frames, keep it quiet; caller can omit
             recs.append("No running/jogging segments detected yet.")
     return recs
 
@@ -1087,6 +969,7 @@ def process_realtime(source=0, output_dir=None, save_video=False, save_csv=False
         recs_so_far = []
         if scorer_snapshot and scorer_snapshot.get("frames_scored", 0) > 0:
             seg_raw_partial = scorer_snapshot.get("segment_raw_partial", {})
+            # inject zeros for keys the partial doesn't have
             seg_raw_for_recs = {
                 "posture": seg_raw_partial.get("posture", 0.0),
                 "shank": seg_raw_partial.get("shank", 0.0),
@@ -1366,5 +1249,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
