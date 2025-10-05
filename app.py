@@ -12,9 +12,16 @@ from fpdf import FPDF
 import mediapipe as mp
 
 import xstep_core as xstep  # your core pipeline
+
+# --- check model availability on startup ---
 try:
-    if not getattr(xstep, "_load_activity_model", None):
-        st.warning("⚠️ Model loader not found in core file.")
+    test_model = xstep._load_activity_model()
+    if test_model is None:
+        st.info("ℹ️ Running in heuristic mode (model file not found). "
+                "To enable ML detection, set MODEL_URL in Streamlit secrets "
+                "or add models/activity_rf.joblib to the repo.")
+    else:
+        st.success("✅ Activity model loaded successfully.")
 except Exception as e:
     st.warning(f"⚠️ Could not initialize model: {e}")
     
@@ -1009,4 +1016,5 @@ with tab_adv:
     else:
 
         st.info("No activity column in CSV.")
+
 
