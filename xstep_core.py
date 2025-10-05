@@ -1,7 +1,7 @@
 """
 Xstep_mediapipe / xstep_core
 Running Posture Correction Analysis Script
-- Now supports loading a zipped model from models/ (e.g., activity_rf.pkl.zip or activity_rf.zip).
+- Supports loading a zipped model from models/ (e.g., activity_rf.pkl.zip or activity_rf.zip).
 - On startup, it searches for an extracted .pkl/.joblib; if not present, it unzips from models/.
 - If loading fails, it falls back to heuristic activity detection.
 
@@ -22,14 +22,12 @@ except ImportError:
 SAVE_FLAGGED_FRAMES = False
 
 # ---------- Safe model loader (zipped-in-models support) ----------
-def _extract_single_member(zf: zipfile.ZipFile, member: str, dest_dir: Path) -> Path:
+def _extract_single_member(zf: zipfile.ZipFile, member: str, dest_dir: Path) -> Path | None:
     """
     Safely extract a single file 'member' from zip into dest_dir (prevents zip slip).
     Returns the destination path.
     """
-    # Normalize paths to avoid traversal
     member_path = Path(member)
-    # ignore directory entries
     if member_path.name == "" or str(member).endswith("/"):
         return None
     dest_path = (dest_dir / member_path).resolve()
@@ -43,53 +41,35 @@ def _extract_single_member(zf: zipfile.ZipFile, member: str, dest_dir: Path) -> 
 
 def _find_existing_model(models_dir: Path,
                          prefer_names=("activity_rf.pkl", "activity_rf.joblib")) -> str | None:
-    # 1) direct paths in CWD and models/
     candidates = [Path(n) for n in prefer_names] + [models_dir / n for n in prefer_names]
     for p in candidates:
         if p.exists() and p.is_file():
             return str(p)
 
-    # 2) recursive search in models/ for preferred names
     if models_dir.exists():
         for p in models_dir.rglob("*"):
             if p.is_file() and p.name in prefer_names:
                 return str(p)
-
-        # 3) fallback: any .pkl/.joblib inside models/
         for p in models_dir.rglob("*"):
             if p.is_file() and p.suffix.lower() in (".pkl", ".joblib"):
                 return str(p)
-
     return None
 
 def _try_unzip_models_dir(models_dir: Path,
                           allowed_exts=(".pkl", ".joblib"),
                           prefer_names=("activity_rf.pkl", "activity_rf.joblib")) -> str | None:
-    """
-    Look for .zip files in models_dir; extract only allowed model files; return path to found model.
-    Accepts either 'activity_rf.pkl.zip' or generic 'activity_rf.zip' containing the .pkl/.joblib.
-    """
     if not models_dir.exists():
         return None
-
-    # First, specific zip names to try early:
     specific_zips = []
     for name in prefer_names:
         specific_zips += [models_dir / f"{name}.zip", models_dir / f"{Path(name).stem}.zip"]
-    # Then, any other zips
     all_zips = {p for p in models_dir.glob("*.zip")}
-    zip_queue = []
-    for z in specific_zips:
-        if z.exists():
-            zip_queue.append(z)
-    zip_queue += [z for z in all_zips if z not in zip_queue]
+    zip_queue = [z for z in specific_zips if z.exists()] + [z for z in all_zips if z not in specific_zips]
 
     for zip_path in zip_queue:
         try:
             with zipfile.ZipFile(zip_path, "r") as zf:
-                # choose the first member that looks like a model file
                 members = zf.namelist()
-                # prefer exact preferred filenames first
                 preferred_member = None
                 for target in prefer_names:
                     for m in members:
@@ -98,7 +78,6 @@ def _try_unzip_models_dir(models_dir: Path,
                             break
                     if preferred_member:
                         break
-                # else pick first allowed ext
                 target_member = preferred_member
                 if not target_member:
                     for m in members:
@@ -107,7 +86,6 @@ def _try_unzip_models_dir(models_dir: Path,
                             target_member = m
                             break
                 if not target_member:
-                    # no usable file in this zip
                     continue
                 dest = _extract_single_member(zf, target_member, models_dir)
                 if dest and dest.suffix.lower() in allowed_exts and dest.exists():
@@ -119,23 +97,11 @@ def _try_unzip_models_dir(models_dir: Path,
 
 def ensure_activity_model(models_dir: str | Path = "models",
                           prefer_names=("activity_rf.pkl", "activity_rf.joblib")) -> str | None:
-    """
-    Ensure the activity model (.pkl/.joblib) is available:
-      1) look in CWD and models/ (preferred names),
-      2) else recursively search models/,
-      3) else unzip any zip in models/ that contains a valid model,
-      4) re-scan and return the found path (or None).
-    """
     models_dir = Path(models_dir)
-    # Fast path: already extracted
     found = _find_existing_model(models_dir, prefer_names=prefer_names)
     if found:
         return found
-
-    # Attempt unzip if needed
     _try_unzip_models_dir(models_dir, allowed_exts=(".pkl", ".joblib"), prefer_names=prefer_names)
-
-    # Re-scan after unzip
     found = _find_existing_model(models_dir, prefer_names=prefer_names)
     if found:
         return found
@@ -229,12 +195,8 @@ def label_trunk_posture(lean_deg, straight_thr=6, arched_thr=-6):
 
 # ---------- Logo For UI (optional for Streamlit apps) ----------
 def place_logo_top_left(height_em: float = 1.8) -> bool:
-    """
-    Shows icon/logo.(png|jpg|jpeg) fixed at the top-left of the page.
-    Returns True if shown, False if no logo file was found.
-    """
     try:
-        import streamlit as st  # local import so this core can run headless too
+        import streamlit as st
     except Exception:
         return False
 
@@ -341,17 +303,14 @@ class RunningDetector:
         self.window = int(max(1, round(window_sec * fps)))
         self.frame_idx = 0
 
-        # Model buffer
         self.model = None
         self.model_labels = []
         self.model_window = int(round(2.0 * fps))
         self.recent_frames = deque(maxlen=self.model_window)
 
-        # Heuristic buffers
         self.left_strikes = deque()
         self.right_strikes = deque()
 
-        # Debounce
         self.stable_state = "not_active"
         self.candidate_state = None
         self.candidate_count = 0
@@ -362,7 +321,6 @@ class RunningDetector:
 
         if HAVE_JOBLIB:
             try:
-                # NEW: find or unzip the activity model from models/
                 model_path = ensure_activity_model(models_dir=os.environ.get("XSTEP_MODELS_DIR", "models"),
                                                    prefer_names=("activity_rf.pkl", "activity_rf.joblib"))
                 if model_path:
@@ -453,7 +411,6 @@ class RunningDetector:
 
     def update(self, features):
         from collections import deque
-        # Record foot strike events (for heuristic)
         if features.get('L_strike'):
             self.left_strikes.append(self.frame_idx)
         if features.get('R_strike'):
@@ -464,7 +421,6 @@ class RunningDetector:
         hz_R = self._hz(self.right_strikes)
         spm_total = 60.0 * (hz_L + hz_R)
 
-        # 1) Raw activity_state from model (if available and warmed) else heuristic
         activity_state = None
         if self.model is not None and len(self.recent_frames) >= self.model_window:
             try:
@@ -477,7 +433,6 @@ class RunningDetector:
                 activity_state = None
 
         if activity_state is None:
-            # Heuristic tiers by steps-per-minute
             if (len(self.left_strikes) + len(self.right_strikes)) < 3:
                 activity_state = "not_active"
             else:
@@ -490,7 +445,6 @@ class RunningDetector:
                 else:
                     activity_state = "running"
 
-        # 2) Debounce (anti-spike)
         debounced_state = self._debounce(activity_state)
 
         self.recent_frames.append(features)
@@ -533,8 +487,6 @@ class StanceScorer:
             return +0.3
         return -0.7
 
-    @staticmethod
-    toof = 0
     @staticmethod
     def _score_foot_strike(strike, activity):
         if not strike or activity in ("not_active", "walking"):
@@ -640,9 +592,6 @@ class StanceScorer:
         return report
 
     def snapshot(self):
-        """
-        Partial, non-final summary suitable for live display (no extra scoring tweaks).
-        """
         weights = {"posture": 1.0, "shank": 0.8, "foot_strike": 1.0, "foot_pitch": 0.6}
         segment_weighted = {}
         total_score = 0.0
@@ -718,7 +667,6 @@ def process_video(video_path, output_dir):
     vid_out_path = os.path.join(output_dir, "annotated.mp4")
     csv_out_path = os.path.join(output_dir, "features.csv")
 
-    # Clean old lap summaries
     for fname in os.listdir(output_dir):
         if fname.startswith("summary_lap_") and fname.endswith(".json"):
             try:
@@ -739,7 +687,6 @@ def process_video(video_path, output_dir):
     detector = RunningDetector(FPS, window_sec=6.0)
     prev_state = {}
 
-    # Lap segmentation
     lap_active = False
     pending_start = False
     pending_frames = 0
@@ -780,7 +727,6 @@ def process_video(video_path, output_dir):
             act_info = detector.update(features)
             activity_state = act_info["state"]
 
-            # --- Lap logic with start confirmation & min-duration guard ---
             if not lap_active:
                 if not pending_start and activity_state in ("running", "jogging"):
                     pending_start = True
@@ -799,7 +745,6 @@ def process_video(video_path, output_dir):
                                              "R": {"heel": 0, "midfoot": 0, "forefoot": 0}}
                             lap_start_frame_idx = frame_idx
                             lap_running_frames = 0
-                            # score the current frame as part of lap
                             stance_scorer.update_frame(features, activity_state)
                             lap_running_frames += 1
                             pb = stance_scorer.details[-1]["posture_bucket"]
@@ -846,7 +791,6 @@ def process_video(video_path, output_dir):
                 else:
                     break_frames += 1
                     if break_frames > max_break_frames:
-                        # End lap; accept only if >= min_lap_frames active
                         lap_end_frame = frame_idx - 1
                         lap_total_frames = lap_end_frame - lap_start_frame_idx + 1
                         if lap_running_frames >= min_lap_frames:
@@ -856,8 +800,6 @@ def process_video(video_path, output_dir):
                             report["active_running_frames"] = lap_running_frames
                             report["posture_distribution"] = posture_counts
                             report["footstrike_distribution"] = strike_counts
-
-                            # Recommendations
                             recs = build_recommendations(report["segment_raw"], report.get("session_notes", {}), posture_counts)
                             report["recommendations"] = recs
 
@@ -868,14 +810,12 @@ def process_video(video_path, output_dir):
                         else:
                             print(f"Discarded short lap (active frames={lap_running_frames} < {min_lap_frames}). No summary created.")
 
-                        # Reset lap state
                         lap_active = False
                         pending_start = False
                         stance_scorer = None
                         posture_counts = None
                         strike_counts = None
 
-            # --------- Drawing overlays ----------
             edges = [
                 ('left_shoulder', 'right_shoulder'), ('left_hip', 'right_hip'),
                 ('left_shoulder', 'left_elbow'), ('left_elbow', 'left_wrist'),
@@ -948,9 +888,8 @@ def process_video(video_path, output_dir):
 
     cap.release(); out_writer.release(); csv_file.close()
 
-    # If a lap is mid-run when video ends, finalize it conditionally
     try:
-        lap_active  # name exists?
+        lap_active
         stance_scorer
     except NameError:
         lap_active = False
@@ -969,7 +908,6 @@ def process_video(video_path, output_dir):
             report["posture_distribution"] = posture_counts or {"Straight":0, "Curved forward":0, "Arched (backward)":0}
             report["footstrike_distribution"] = strike_counts or {"L":{"heel":0,"midfoot":0,"forefoot":0},
                                                                   "R":{"heel":0,"midfoot":0,"forefoot":0}}
-            # Recommendations
             report["recommendations"] = build_recommendations(report["segment_raw"], report.get("session_notes", {}), posture_counts)
 
             summary_path = os.path.join(output_dir, f"summary_lap_{saved_lap_count}.json")
@@ -979,7 +917,6 @@ def process_video(video_path, output_dir):
         else:
             print(f"Discarded short lap at end of video (active frames={lap_running_frames} < {min_lap_frames}). No summary created.")
 
-    # If no accepted laps at all, create a single “no running” summary
     if saved_lap_count == 0:
         total_frames = frame_idx
         seg_raw = {"posture": 0.0, "shank": 0.0, "foot_strike": 0.0, "foot_pitch": 0.0, "msa": 0.0, "symmetry": 0.0}
@@ -1004,7 +941,7 @@ def process_video(video_path, output_dir):
             json.dump(report, jf, indent=2)
         print("No accepted laps -> summary_lap_1.json created (informational).")
 
-# ---------- Robust realtime capture opener (Windows-friendly) ----------
+# ---------- Robust realtime capture opener ----------
 def _open_capture_flex(source):
     info = {"backend": None, "device_index": None, "fourcc_set": False}
 
@@ -1048,17 +985,10 @@ def _open_capture_flex(source):
                 except Exception:
                     pass
                 return c, info
-
     return None, info
 
-# ---------- Realtime processing (with live summary + recommendations) ----------
+# ---------- Realtime processing ----------
 def process_realtime(source=0, output_dir=None, save_video=False, save_csv=False):
-    """
-    Realtime mode using webcam/stream/file.
-    - source: 0 (default webcam), video path, or URL
-    - output_dir: optional folder to save annotated video & CSV and live summary
-    - save_video / save_csv: toggle recording
-    """
     cap, caminfo = _open_capture_flex(source)
     if cap is None or not cap.isOpened():
         raise RuntimeError(
@@ -1211,7 +1141,6 @@ def process_realtime(source=0, output_dir=None, save_video=False, save_csv=False
             act_info = detector.update(features)
             activity_state = act_info["state"]
 
-            # Lap logic
             if not lap_active:
                 if not pending_start and activity_state in ("running", "jogging"):
                     pending_start = True
@@ -1287,7 +1216,6 @@ def process_realtime(source=0, output_dir=None, save_video=False, save_csv=False
                         strike_counts = None
                         lap_running_frames = 0
 
-            # --- draw overlays ---
             edges = [
                 ('left_shoulder', 'right_shoulder'), ('left_hip', 'right_hip'),
                 ('left_shoulder', 'left_elbow'), ('left_elbow', 'left_wrist'),
@@ -1389,7 +1317,6 @@ def main():
                          save_video=args.save_video, save_csv=args.save_csv)
         return
 
-    # batch mode
     in_dir = "input" if os.path.isdir("input") else "video"
     if not os.path.isdir(in_dir):
         print("No input/ or video/ folder found. Place .mp4 files in 'input'.")
