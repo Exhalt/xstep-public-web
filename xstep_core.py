@@ -1,14 +1,14 @@
 """
-Xstep_mediapipe.py
-Running Posture Correction Analysis Script (debounced + min-lap-duration + robust realtime I/O + live summary)
-- Anti-spike activity debounce so it doesn't flash "running" at start.
-- Ignores any running/jogging segment shorter than 3 seconds (no summary).
-- Realtime mode: robust camera open on Windows, MP4/AVI writer fallbacks, CSV flush.
-- Live summary: writes a rolling JSON file (live_summary.json) in realtime mode, now with recommendations.
+Xstep_mediapipe / xstep_core
+Running Posture Correction Analysis Script
+- Now supports loading a zipped model from models/ (e.g., activity_rf.pkl.zip or activity_rf.zip).
+- On startup, it searches for an extracted .pkl/.joblib; if not present, it unzips from models/.
+- If loading fails, it falls back to heuristic activity detection.
 
 Author: you + ChatGPT
 """
-import os, sys, csv, json, platform, time
+import os, sys, csv, json, platform, time, base64, zipfile, shutil
+from pathlib import Path
 import cv2
 import numpy as np
 
@@ -20,6 +20,126 @@ except ImportError:
     HAVE_JOBLIB = False
 
 SAVE_FLAGGED_FRAMES = False
+
+# ---------- Safe model loader (zipped-in-models support) ----------
+def _extract_single_member(zf: zipfile.ZipFile, member: str, dest_dir: Path) -> Path:
+    """
+    Safely extract a single file 'member' from zip into dest_dir (prevents zip slip).
+    Returns the destination path.
+    """
+    # Normalize paths to avoid traversal
+    member_path = Path(member)
+    # ignore directory entries
+    if member_path.name == "" or str(member).endswith("/"):
+        return None
+    dest_path = (dest_dir / member_path).resolve()
+    dest_dir_resolved = dest_dir.resolve()
+    if not str(dest_path).startswith(str(dest_dir_resolved)):
+        raise RuntimeError(f"Unsafe zip path detected: {member}")
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    with zf.open(member) as src, open(dest_path, "wb") as out:
+        shutil.copyfileobj(src, out)
+    return dest_path
+
+def _find_existing_model(models_dir: Path,
+                         prefer_names=("activity_rf.pkl", "activity_rf.joblib")) -> str | None:
+    # 1) direct paths in CWD and models/
+    candidates = [Path(n) for n in prefer_names] + [models_dir / n for n in prefer_names]
+    for p in candidates:
+        if p.exists() and p.is_file():
+            return str(p)
+
+    # 2) recursive search in models/ for preferred names
+    if models_dir.exists():
+        for p in models_dir.rglob("*"):
+            if p.is_file() and p.name in prefer_names:
+                return str(p)
+
+        # 3) fallback: any .pkl/.joblib inside models/
+        for p in models_dir.rglob("*"):
+            if p.is_file() and p.suffix.lower() in (".pkl", ".joblib"):
+                return str(p)
+
+    return None
+
+def _try_unzip_models_dir(models_dir: Path,
+                          allowed_exts=(".pkl", ".joblib"),
+                          prefer_names=("activity_rf.pkl", "activity_rf.joblib")) -> str | None:
+    """
+    Look for .zip files in models_dir; extract only allowed model files; return path to found model.
+    Accepts either 'activity_rf.pkl.zip' or generic 'activity_rf.zip' containing the .pkl/.joblib.
+    """
+    if not models_dir.exists():
+        return None
+
+    # First, specific zip names to try early:
+    specific_zips = []
+    for name in prefer_names:
+        specific_zips += [models_dir / f"{name}.zip", models_dir / f"{Path(name).stem}.zip"]
+    # Then, any other zips
+    all_zips = {p for p in models_dir.glob("*.zip")}
+    zip_queue = []
+    for z in specific_zips:
+        if z.exists():
+            zip_queue.append(z)
+    zip_queue += [z for z in all_zips if z not in zip_queue]
+
+    for zip_path in zip_queue:
+        try:
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                # choose the first member that looks like a model file
+                members = zf.namelist()
+                # prefer exact preferred filenames first
+                preferred_member = None
+                for target in prefer_names:
+                    for m in members:
+                        if m.lower().endswith(target.lower()):
+                            preferred_member = m
+                            break
+                    if preferred_member:
+                        break
+                # else pick first allowed ext
+                target_member = preferred_member
+                if not target_member:
+                    for m in members:
+                        low = m.lower()
+                        if any(low.endswith(ext) for ext in allowed_exts):
+                            target_member = m
+                            break
+                if not target_member:
+                    # no usable file in this zip
+                    continue
+                dest = _extract_single_member(zf, target_member, models_dir)
+                if dest and dest.suffix.lower() in allowed_exts and dest.exists():
+                    return str(dest)
+        except Exception as e:
+            print(f"[model] WARNING: failed to unzip {zip_path.name}: {e}")
+            continue
+    return None
+
+def ensure_activity_model(models_dir: str | Path = "models",
+                          prefer_names=("activity_rf.pkl", "activity_rf.joblib")) -> str | None:
+    """
+    Ensure the activity model (.pkl/.joblib) is available:
+      1) look in CWD and models/ (preferred names),
+      2) else recursively search models/,
+      3) else unzip any zip in models/ that contains a valid model,
+      4) re-scan and return the found path (or None).
+    """
+    models_dir = Path(models_dir)
+    # Fast path: already extracted
+    found = _find_existing_model(models_dir, prefer_names=prefer_names)
+    if found:
+        return found
+
+    # Attempt unzip if needed
+    _try_unzip_models_dir(models_dir, allowed_exts=(".pkl", ".joblib"), prefer_names=prefer_names)
+
+    # Re-scan after unzip
+    found = _find_existing_model(models_dir, prefer_names=prefer_names)
+    if found:
+        return found
+    return None
 
 # MediaPipe pose landmark indices (33 landmarks)
 POSE_LM = {
@@ -107,6 +227,45 @@ def label_trunk_posture(lean_deg, straight_thr=6, arched_thr=-6):
         return "Arched (backward)"
     return "Straight"
 
+# ---------- Logo For UI (optional for Streamlit apps) ----------
+def place_logo_top_left(height_em: float = 1.8) -> bool:
+    """
+    Shows icon/logo.(png|jpg|jpeg) fixed at the top-left of the page.
+    Returns True if shown, False if no logo file was found.
+    """
+    try:
+        import streamlit as st  # local import so this core can run headless too
+    except Exception:
+        return False
+
+    base_dir = Path(__file__).parent if "__file__" in globals() else Path.cwd()
+    for ext in ("png", "jpg", "jpeg"):
+        logo_path = base_dir / "icon" / f"logo.{ext}"
+        if logo_path.exists():
+            mime = "image/png" if ext == "png" else "image/jpeg"
+            b64 = base64.b64encode(logo_path.read_bytes()).decode("ascii")
+            st.markdown(
+                f"""
+                <style>
+                  .xstep-logo {{
+                    position: fixed; top: 10px; left: 12px; z-index: 9999;
+                  }}
+                  .xstep-logo img {{
+                    height: {height_em}em; width: auto; object-fit: contain;
+                  }}
+                  @media (max-width: 640px) {{
+                    .xstep-logo img {{ height: {max(1.2, height_em-0.4)}em; }}
+                  }}
+                </style>
+                <div class="xstep-logo">
+                  <img src="data:{mime};base64,{b64}" alt="Xstep logo"/>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            return True
+    return False
+
 # ---------- Feature extraction ----------
 def extract_running_features(landmarks, image_w, image_h, prev_state):
     def safe_pt(lm, conf_thr=0.4):
@@ -174,9 +333,9 @@ class RunningDetector:
     Adds DEBOUNCE so classification labels don't spike (e.g., show "running" at video start).
     """
     def __init__(self, fps, window_sec=6.0,
-                 anti_spike_to_run_sec=0.75,   # require this long to promote -> jogging/running
-                 anti_spike_to_idle_sec=0.50,  # require this long to demote -> walking/not_active
-                 anti_spike_between_run_sec=0.30):  # jogging<->running smoothing
+                 anti_spike_to_run_sec=0.75,
+                 anti_spike_to_idle_sec=0.50,
+                 anti_spike_between_run_sec=0.30):
         from collections import deque
         self.fps = fps
         self.window = int(max(1, round(window_sec * fps)))
@@ -203,11 +362,19 @@ class RunningDetector:
 
         if HAVE_JOBLIB:
             try:
-                md = joblib.load("activity_rf.pkl")
-                self.model = md.get("model", None)
-                self.model_labels = md.get("labels", [])
+                # NEW: find or unzip the activity model from models/
+                model_path = ensure_activity_model(models_dir=os.environ.get("XSTEP_MODELS_DIR", "models"),
+                                                   prefer_names=("activity_rf.pkl", "activity_rf.joblib"))
+                if model_path:
+                    md = joblib.load(model_path)
+                    self.model = md.get("model", None)
+                    self.model_labels = md.get("labels", [])
+                    print(f"[RunningDetector] Loaded model from: {model_path}")
+                else:
+                    print("[RunningDetector] No model found in models/ (or failed to unzip) -> using heuristic fallback.")
+                    self.model = None
             except Exception as e:
-                print(f"[RunningDetector] Warning: cannot load activity_rf.pkl -> heuristic (reason: {e})")
+                print(f"[RunningDetector] Warning: cannot load model -> heuristic (reason: {e})")
                 self.model = None
         else:
             print("[RunningDetector] joblib not available -> using heuristic fallback.")
@@ -285,6 +452,7 @@ class RunningDetector:
         return self.stable_state
 
     def update(self, features):
+        from collections import deque
         # Record foot strike events (for heuristic)
         if features.get('L_strike'):
             self.left_strikes.append(self.frame_idx)
@@ -365,6 +533,8 @@ class StanceScorer:
             return +0.3
         return -0.7
 
+    @staticmethod
+    toof = 0
     @staticmethod
     def _score_foot_strike(strike, activity):
         if not strike or activity in ("not_active", "walking"):
@@ -493,12 +663,7 @@ class StanceScorer:
 
 # ---------- Shared recommendations helper ----------
 def build_recommendations(seg_raw, notes=None, posture_counts=None):
-    """
-    Generate human-readable recommendations from segment scores and session notes.
-    Works for both finalized (batch) and partial (realtime snapshot) data.
-    """
     recs = []
-    # Core segments
     if seg_raw.get("posture", 0) < 0:
         recs.append("Maintain a more upright torso: avoid leaning too far forward or arching backward while running.")
     if seg_raw.get("shank", 0) < 0:
@@ -508,7 +673,6 @@ def build_recommendations(seg_raw, notes=None, posture_counts=None):
     if seg_raw.get("foot_pitch", 0) < 0:
         recs.append("Aim to contact the ground with a flatter foot (not excessively toe-pointed or heel-first).")
 
-    # Notes-based (MSA/symmetry) if available
     if notes:
         if notes.get("symmetry") == "poor" or seg_raw.get("symmetry", 0) < 0:
             recs.append("Improve left-right balance with strength and form drills.")
@@ -526,12 +690,10 @@ def build_recommendations(seg_raw, notes=None, posture_counts=None):
             elif MSA_R > 70:
                 recs.append(f"Reduce right overstride: right shank angle {MSA_R:.1f}° (above ~40–70°).")
 
-    # Friendly default when nothing negative detected
     if not recs:
         if posture_counts and sum(posture_counts.values()) > 0:
             recs.append("Overall running form looks good – no major issues detected.")
         else:
-            # for realtime partials with zero frames, keep it quiet; caller can omit
             recs.append("No running/jogging segments detected yet.")
     return recs
 
@@ -695,7 +857,7 @@ def process_video(video_path, output_dir):
                             report["posture_distribution"] = posture_counts
                             report["footstrike_distribution"] = strike_counts
 
-                            # Recommendations (shared helper)
+                            # Recommendations
                             recs = build_recommendations(report["segment_raw"], report.get("session_notes", {}), posture_counts)
                             report["recommendations"] = recs
 
@@ -807,7 +969,7 @@ def process_video(video_path, output_dir):
             report["posture_distribution"] = posture_counts or {"Straight":0, "Curved forward":0, "Arched (backward)":0}
             report["footstrike_distribution"] = strike_counts or {"L":{"heel":0,"midfoot":0,"forefoot":0},
                                                                   "R":{"heel":0,"midfoot":0,"forefoot":0}}
-            # Recommendations (shared)
+            # Recommendations
             report["recommendations"] = build_recommendations(report["segment_raw"], report.get("session_notes", {}), posture_counts)
 
             summary_path = os.path.join(output_dir, f"summary_lap_{saved_lap_count}.json")
@@ -965,11 +1127,9 @@ def process_realtime(source=0, output_dir=None, save_video=False, save_csv=False
         if not force and (now - last_live_write < 1.0):
             return
 
-        # Build provisional recommendations from partial segment_raw
         recs_so_far = []
         if scorer_snapshot and scorer_snapshot.get("frames_scored", 0) > 0:
             seg_raw_partial = scorer_snapshot.get("segment_raw_partial", {})
-            # inject zeros for keys the partial doesn't have
             seg_raw_for_recs = {
                 "posture": seg_raw_partial.get("posture", 0.0),
                 "shank": seg_raw_partial.get("shank", 0.0),
@@ -1069,7 +1229,6 @@ def process_realtime(source=0, output_dir=None, save_video=False, save_csv=False
                             strike_counts = {"L": {"heel": 0, "midfoot": 0, "forefoot": 0},
                                              "R": {"heel": 0, "midfoot": 0, "forefoot": 0}}
                             lap_running_frames = 0
-                            # immediate live write on lap start (no recs yet)
                             write_live_summary(activity_state, True, 0, posture_counts, strike_counts, {}, force=True)
                     else:
                         pending_start = False
@@ -1105,7 +1264,6 @@ def process_realtime(source=0, output_dir=None, save_video=False, save_csv=False
                         if lap_running_frames >= min_lap_frames:
                             rpt = stance_scorer.finalize()
                             saved_lap_count += 1
-                            # finalize recommendations and write to live summary
                             final_recs = build_recommendations(rpt.get("segment_raw", {}), rpt.get("session_notes", {}), posture_counts)
                             if live_summary_path:
                                 try:
@@ -1123,7 +1281,6 @@ def process_realtime(source=0, output_dir=None, save_video=False, save_csv=False
                                     pass
                             print("[lap] ended (active_frames=", lap_running_frames,
                                   ", total_score=", round(rpt["total_score"], 2), ")")
-                        # reset
                         lap_active = False
                         stance_scorer = None
                         posture_counts = None
@@ -1186,7 +1343,6 @@ def process_realtime(source=0, output_dir=None, save_video=False, save_csv=False
                     csv_file.flush()
                     csv_rows_since_flush = 0
 
-            # ---- update live summary (~1 Hz) with recommendations_so_far ----
             scorer_snapshot = stance_scorer.snapshot() if (lap_active and stance_scorer is not None) else {}
             write_live_summary(activity_state, lap_active, lap_running_frames if lap_active else 0,
                                posture_counts, strike_counts, scorer_snapshot, force=False)
