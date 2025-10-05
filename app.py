@@ -32,6 +32,16 @@ except Exception as e:
 import zipfile, joblib, os
 from pathlib import Path
 
+def load_model_zip():
+    model_zip = Path("models/activity_rf.zip")
+    model_pkl = Path("models/activity_rf.pkl")
+
+    if not model_pkl.exists() and model_zip.exists():
+        with zipfile.ZipFile(model_zip, "r") as zf:
+            zf.extractall("models")
+
+    return joblib.load(model_pkl)
+
 st.set_page_config(page_title="Xstep – Running Posture Analysis", layout="wide")
 
 # ---- Windows asyncio (helps Streamlit on Win) ----
