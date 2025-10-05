@@ -18,27 +18,67 @@ from pathlib import Path
 
 def _load_activity_model():
     """
-    Try to load the activity model from multiple sources:
-      1. Local 'models/activity_rf.joblib' or 'activity_rf.zip'
-      2. Cached file under '.cache_models/activity_rf.joblib'
-      3. Download via URL in Streamlit secrets or env var 'MODEL_URL'
+    Load the activity model in this priority order:
+      1. Local models/activity_rf.joblib
+      2. Local models/activity_rf.zip (auto-extracts)
+      3. Cached copy under .cache_models/
+      4. Download from Streamlit secrets or MODEL_URL env var
     """
     base = Path(__file__).resolve().parent
     model_dir = base / "models"
-    local_files = [
+    local_candidates = [
         model_dir / "activity_rf.joblib",
         model_dir / "activity_rf.zip",
     ]
-    for path in local_files:
-        if path.exists():
-            if path.suffix == ".zip":
-                with zipfile.ZipFile(path, "r") as zf:
+
+    # --- 1) Local models directory ---
+    for p in local_candidates:
+        if p.exists():
+            print(f"[_load_activity_model] Using local {p.name}")
+            if p.suffix == ".zip":
+                with zipfile.ZipFile(p, "r") as zf:
                     zf.extractall(model_dir)
                     inner = model_dir / "activity_rf.joblib"
                     if inner.exists():
                         return joblib.load(inner)
             else:
-                return joblib.load(path)
+                return joblib.load(p)
+
+    # --- 2) Cache folder ---
+    cache_dir = base / ".cache_models"
+    cache_dir.mkdir(exist_ok=True)
+    cache_path = cache_dir / "activity_rf.joblib"
+    if cache_path.exists():
+        print("[_load_activity_model] Using cached model copy")
+        return joblib.load(cache_path)
+
+    # --- 3) Streamlit secret or env URL ---
+    url = os.getenv("MODEL_URL")
+    if not url:
+        try:
+            import streamlit as st
+            url = st.secrets.get("MODEL_URL")
+        except Exception:
+            url = None
+    if not url:
+        print("[_load_activity_model] No model found locally or remotely.")
+        return None
+
+    print(f"[_load_activity_model] Downloading model from {url}")
+    r = requests.get(url, timeout=120)
+    r.raise_for_status()
+
+    if url.endswith(".zip"):
+        ztmp = cache_dir / "activity_rf.zip"
+        ztmp.write_bytes(r.content)
+        with zipfile.ZipFile(ztmp, "r") as zf:
+            zf.extractall(cache_dir)
+        if cache_path.exists():
+            return joblib.load(cache_path)
+    else:
+        cache_path.write_bytes(r.content)
+        return joblib.load(cache_path)
+    return None
 
     # --- fallback: download ---
     url = os.getenv("MODEL_URL")
@@ -229,54 +269,49 @@ def extract_running_features(landmarks, image_w, image_h, prev_state):
 # ---------- Activity detector with debounce ----------
 class RunningDetector:
     """
-    Detects running/jogging vs walking/not_active using a trained model (if available) or a heuristic.
-    Adds DEBOUNCE so classification labels don't spike (e.g., show "running" at video start).
+    Detects running/jogging vs walking/not_active using a trained model
+    (if available) or a heuristic fallback.
     """
     def __init__(self, fps, window_sec=6.0,
-                 anti_spike_to_run_sec=0.75,   # require this long to promote -> jogging/running
-                 anti_spike_to_idle_sec=0.50,  # require this long to demote -> walking/not_active
-                 anti_spike_between_run_sec=0.30):  # jogging<->running smoothing
+                 anti_spike_to_run_sec=0.75,
+                 anti_spike_to_idle_sec=0.50,
+                 anti_spike_between_run_sec=0.30):
         from collections import deque
         self.fps = fps
         self.window = int(max(1, round(window_sec * fps)))
         self.frame_idx = 0
-
-        # Model buffer
         self.model = None
         self.model_labels = []
         self.model_window = int(round(2.0 * fps))
         self.recent_frames = deque(maxlen=self.model_window)
 
-        # Heuristic buffers
         self.left_strikes = deque()
         self.right_strikes = deque()
-
-        # Debounce
         self.stable_state = "not_active"
         self.candidate_state = None
         self.candidate_count = 0
-
-        self.to_run_frames  = max(1, int(round(anti_spike_to_run_sec * fps)))
+        self.to_run_frames = max(1, int(round(anti_spike_to_run_sec * fps)))
         self.to_idle_frames = max(1, int(round(anti_spike_to_idle_sec * fps)))
         self.between_run_frames = max(1, int(round(anti_spike_between_run_sec * fps)))
 
-       if HAVE_JOBLIB:
-    try:
-        md = _load_activity_model()
-        if isinstance(md, dict):
-            self.model = md.get("model", None)
-            self.model_labels = md.get("labels", [])
+        # --- NEW unified model loader ---
+        if HAVE_JOBLIB:
+            try:
+                md = _load_activity_model()
+                if isinstance(md, dict):
+                    self.model = md.get("model", None)
+                    self.model_labels = md.get("labels", [])
+                else:
+                    self.model = md
+                    self.model_labels = []
+                if self.model is None:
+                    print("[RunningDetector] Warning: model empty → heuristic.")
+            except Exception as e:
+                print(f"[RunningDetector] Warning: cannot load model (reason: {e})")
+                self.model = None
         else:
-            self.model = md
-            self.model_labels = []
-        if self.model is None:
-            print("[RunningDetector] Warning: Model object missing, using heuristic.")
-    except Exception as e:
-        print(f"[RunningDetector] Warning: cannot load model -> heuristic (reason: {e})")
-        self.model = None
-else:
-    print("[RunningDetector] joblib not available -> heuristic fallback.")
-
+            print("[RunningDetector] joblib not available → heuristic fallback.")
+            
     def _trim(self, deq):
         while deq and (self.frame_idx - deq[0] > self.window):
             deq.popleft()
@@ -1314,4 +1349,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
