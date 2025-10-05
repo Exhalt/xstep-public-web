@@ -12,6 +12,12 @@ from fpdf import FPDF
 import mediapipe as mp
 
 import xstep_core as xstep  # your core pipeline
+try:
+    if not getattr(xstep, "_load_activity_model", None):
+        st.warning("⚠️ Model loader not found in core file.")
+except Exception as e:
+    st.warning(f"⚠️ Could not initialize model: {e}")
+    
 import zipfile, joblib, os
 from pathlib import Path
 
@@ -1003,3 +1009,4 @@ with tab_adv:
     else:
 
         st.info("No activity column in CSV.")
+
