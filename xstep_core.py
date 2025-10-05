@@ -17,7 +17,7 @@ import numpy as np
 from pathlib import Path
 
 # ---------- Model loader helper ----------
-import joblib, zipfile, requests
+import joblib, zipfile, requests, gzip
 
 # DEFAULT public URL fallback (used if neither env MODEL_URL nor Streamlit secrets set)
 DEFAULT_MODEL_URL = "https://github.com/Exhalt/xstep-public-web/archive/refs/tags/models.zip"
@@ -49,40 +49,36 @@ def _safe_joblib_load(path: Path):
     return obj
 
 def _load_activity_model():
-    """
-    Load the activity model in this priority order:
-      1) Local models/activity_rf.pkl|.joblib
-      2) Local models/activity_rf.zip  (extract first *.pkl|*.joblib inside)
-      3) Cached copy under .cache_models/ (activity_rf.pkl|.joblib)
-      4) Download from URL (Streamlit secrets MODEL_URL, env MODEL_URL, or DEFAULT_MODEL_URL)
-         - Supports direct *.pkl/*.joblib
-         - Supports *.zip including GitHub tag archives (we scan for *.pkl|*.joblib inside)
-    Returns the loaded object, or None if not found.
-    """
-    base = Path(__file__).resolve().parent
-    model_dir = base / "models"
-    model_dir.mkdir(exist_ok=True)
+    base = Path(file).resolve().parent
+    models_dir = base / "models"
+    cache_dir = base / ".cache_models"
+    cache_dir.mkdir(exist_ok=True)
 
-    # --- 1) Local models directory ---
-    local_candidates = [
-        model_dir / "activity_rf.pkl",
-        model_dir / "activity_rf.joblib",
-        model_dir / "activity_rf.zip",
-    ]
-    for p in local_candidates:
-        if p.exists():
-            print(f"[_load_activity_model] Using local {p.name}")
-            if p.suffix.lower() == ".zip":
-                with zipfile.ZipFile(p, "r") as zf:
-                    name, ext = _find_model_in_zipfile(zf)
-                    if not name:
-                        raise RuntimeError("Local activity_rf.zip found, but no *.pkl/*.joblib inside.")
-                    out_path = model_dir / f"activity_rf{ext}"
-                    with zf.open(name) as f:
-                        out_path.write_bytes(f.read())
-                    return _safe_joblib_load(out_path)
-            else:
-                return _safe_joblib_load(p)
+    pkl = models_dir / "activity_rf.pkl"
+    gz  = models_dir / "activity_rf.pkl.gz"
+    zip_path = models_dir / "activity_rf.pkl.zip"
+
+    if pkl.exists():
+        return joblib.load(pkl)
+
+    if gz.exists():
+        with gzip.open(gz, "rb") as f:
+            return joblib.load(f)
+
+    if zip_path.exists():
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            names = [n for n in zf.namelist() if n.endswith(".pkl")]
+            if not names:
+                raise RuntimeError("ZIP has no .pkl inside.")
+            name = names[0]
+            out = cache_dir / Path(name).name
+            if not out.exists():
+                out.write_bytes(zf.read(name))
+            return joblib.load(out)
+
+    raise FileNotFoundError(
+        "No model found. Expected one of: models/activity_rf.pkl, .pkl.gz, or .pkl.zip"
+    )
 
     # --- 2) Cache folder ---
     cache_dir = base / ".cache_models"
@@ -323,13 +319,14 @@ class RunningDetector:
         # --- unified model loader ---
         if HAVE_JOBLIB:
             try:
-                md = _load_activity_model()
-                if isinstance(md, dict):
-                    self.model = md.get("model", None)
-                    self.model_labels = md.get("labels", [])
-                else:
-                    self.model = md
-                    self.model_labels = []
+               md = _load_activity_model()
+               if isinstance(md, dict):
+                  self.model = md.get("model")
+                  self.model_labels = md.get("labels", [])
+               else:
+                  self.model = md
+                  self.model_labels = []
+                      
                 if self.model is None:
                     print("[RunningDetector] Warning: model empty → heuristic fallback.")
             except Exception as e:
@@ -1373,3 +1370,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
