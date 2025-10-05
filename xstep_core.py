@@ -6,12 +6,70 @@ Running Posture Correction Analysis Script (debounced + min-lap-duration + robus
 - Realtime mode: robust camera open on Windows, MP4/AVI writer fallbacks, CSV flush.
 - Live summary: writes a rolling JSON file (live_summary.json) in realtime mode, now with recommendations.
 
-Author: you + ChatGPT
 """
 import os, sys, csv, json, platform, time
 import cv2
 import numpy as np
 from pathlib import Path
+
+# ---------- Model loader helper ----------
+import joblib, zipfile, requests
+from pathlib import Path
+
+def _load_activity_model():
+    """
+    Try to load the activity model from multiple sources:
+      1. Local 'models/activity_rf.joblib' or 'activity_rf.zip'
+      2. Cached file under '.cache_models/activity_rf.joblib'
+      3. Download via URL in Streamlit secrets or env var 'MODEL_URL'
+    """
+    base = Path(__file__).resolve().parent
+    model_dir = base / "models"
+    local_files = [
+        model_dir / "activity_rf.joblib",
+        model_dir / "activity_rf.zip",
+    ]
+    for path in local_files:
+        if path.exists():
+            if path.suffix == ".zip":
+                with zipfile.ZipFile(path, "r") as zf:
+                    zf.extractall(model_dir)
+                    inner = model_dir / "activity_rf.joblib"
+                    if inner.exists():
+                        return joblib.load(inner)
+            else:
+                return joblib.load(path)
+
+    # --- fallback: download ---
+    url = os.getenv("MODEL_URL")
+    if not url:
+        try:
+            import streamlit as st
+            url = st.secrets.get("MODEL_URL")
+        except Exception:
+            url = None
+    if not url:
+        print("[_load_activity_model] No local or remote model found.")
+        return None
+
+    cache_dir = base / ".cache_models"
+    cache_dir.mkdir(exist_ok=True)
+    cache_file = cache_dir / "activity_rf.joblib"
+
+    if not cache_file.exists():
+        print(f"[_load_activity_model] Downloading model from {url}")
+        r = requests.get(url, timeout=120)
+        r.raise_for_status()
+        if url.endswith(".zip"):
+            ztmp = cache_dir / "activity_rf.zip"
+            ztmp.write_bytes(r.content)
+            with zipfile.ZipFile(ztmp, "r") as zf:
+                zf.extractall(cache_dir)
+            if cache_file.exists():
+                return joblib.load(cache_file)
+        else:
+            cache_file.write_bytes(r.content)
+    return joblib.load(cache_file) if cache_file.exists() else None
 
 # Try to import joblib for loading model (if available)
 try:
@@ -202,17 +260,22 @@ class RunningDetector:
         self.to_idle_frames = max(1, int(round(anti_spike_to_idle_sec * fps)))
         self.between_run_frames = max(1, int(round(anti_spike_between_run_sec * fps)))
 
-        if HAVE_JOBLIB:
-            try:
-                model_path = Path(file).resolve().parent / "models" / "activity_rf.pkl"
-                md = joblib.load(model_path)
-                self.model = md.get("model", None)
-                self.model_labels = md.get("labels", [])
-            except Exception as e:
-                print(f"[RunningDetector] Warning: cannot load activity_rf.pkl -> heuristic (reason: {e})")
-                self.model = None
+       if HAVE_JOBLIB:
+    try:
+        md = _load_activity_model()
+        if isinstance(md, dict):
+            self.model = md.get("model", None)
+            self.model_labels = md.get("labels", [])
         else:
-            print("[RunningDetector] joblib not available -> using heuristic fallback.")
+            self.model = md
+            self.model_labels = []
+        if self.model is None:
+            print("[RunningDetector] Warning: Model object missing, using heuristic.")
+    except Exception as e:
+        print(f"[RunningDetector] Warning: cannot load model -> heuristic (reason: {e})")
+        self.model = None
+else:
+    print("[RunningDetector] joblib not available -> heuristic fallback.")
 
     def _trim(self, deq):
         while deq and (self.frame_idx - deq[0] > self.window):
@@ -1251,3 +1314,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
