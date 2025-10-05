@@ -49,7 +49,7 @@ def _safe_joblib_load(path: Path):
     return obj
 
 def _load_activity_model():
-    base = Path(file).resolve().parent
+    base = Path(__file__).resolve().parent
     models_dir = base / "models"
     cache_dir = base / ".cache_models"
     cache_dir.mkdir(exist_ok=True)
@@ -75,10 +75,6 @@ def _load_activity_model():
             if not out.exists():
                 out.write_bytes(zf.read(name))
             return joblib.load(out)
-
-    raise FileNotFoundError(
-        "No model found. Expected one of: models/activity_rf.pkl, .pkl.gz, or .pkl.zip"
-    )
 
     # --- 2) Cache folder ---
     cache_dir = base / ".cache_models"
@@ -319,13 +315,14 @@ class RunningDetector:
         # --- unified model loader ---
         if HAVE_JOBLIB:
             try:
-               md = _load_activity_model()
-               if isinstance(md, dict):
-                  self.model = md.get("model")
-                  self.model_labels = md.get("labels", [])
-               else:
-                  self.model = md
-                  self.model_labels = []   
+                md = _load_activity_model()
+                if isinstance(md, dict):
+                    self.model = md.get("model")
+                    self.model_labels = md.get("labels", [])
+                else:
+                    self.model = md
+                    self.model_labels = []
+
                 if self.model is None:
                     print("[RunningDetector] Warning: model empty → heuristic fallback.")
             except Exception as e:
