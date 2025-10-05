@@ -1,115 +1,141 @@
 """
 Xstep_mediapipe.py
 Running Posture Correction Analysis Script (debounced + min-lap-duration + robust realtime I/O + live summary)
+
 - Anti-spike activity debounce so it doesn't flash "running" at start.
 - Ignores any running/jogging segment shorter than 3 seconds (no summary).
 - Realtime mode: robust camera open on Windows, MP4/AVI writer fallbacks, CSV flush.
 - Live summary: writes a rolling JSON file (live_summary.json) in realtime mode, now with recommendations.
+- Model loader can pull from a GitHub Release/Tag URL (.zip/.pkl/.joblib), caches to .cache_models/,
+       and falls back to local models/ if present.
 
 """
-import os, sys, csv, json, platform, time
+
+import os, sys, csv, json, platform, time, io
 import cv2
 import numpy as np
 from pathlib import Path
 
 # ---------- Model loader helper ----------
 import joblib, zipfile, requests
-from pathlib import Path
+
+# DEFAULT public URL fallback (used if neither env MODEL_URL nor Streamlit secrets set)
+DEFAULT_MODEL_URL = "https://github.com/Exhalt/xstep-public-web/archive/refs/tags/models.zip"
+
+def _find_model_in_zipfile(zf: zipfile.ZipFile):
+    """
+    Search a ZipFile for a model file. Prefer names that look like activity_rf.*,
+    otherwise take the first *.pkl or *.joblib we see.
+    Returns (name_in_zip, ext) or (None, None).
+    """
+    names = zf.namelist()
+    # Prefer explicit names
+    prefer = [n for n in names if n.lower().endswith((".pkl", ".joblib")) and "activity_rf" in n.lower()]
+    if prefer:
+        name = prefer[0]
+        ext = ".joblib" if name.lower().endswith(".joblib") else ".pkl"
+        return name, ext
+    # Else any model-like file
+    any_model = [n for n in names if n.lower().endswith((".pkl", ".joblib"))]
+    if any_model:
+        name = any_model[0]
+        ext = ".joblib" if name.lower().endswith(".joblib") else ".pkl"
+        return name, ext
+    return None, None
+
+def _safe_joblib_load(path: Path):
+    """Load with joblib and handle both dict pickle ({'model':..., 'labels':[...]}) or pure estimator."""
+    obj = joblib.load(path)
+    return obj
 
 def _load_activity_model():
     """
     Load the activity model in this priority order:
-      1. Local models/activity_rf.joblib
-      2. Local models/activity_rf.zip (auto-extracts)
-      3. Cached copy under .cache_models/
-      4. Download from Streamlit secrets or MODEL_URL env var
+      1) Local models/activity_rf.pkl|.joblib
+      2) Local models/activity_rf.zip  (extract first *.pkl|*.joblib inside)
+      3) Cached copy under .cache_models/ (activity_rf.pkl|.joblib)
+      4) Download from URL (Streamlit secrets MODEL_URL, env MODEL_URL, or DEFAULT_MODEL_URL)
+         - Supports direct *.pkl/*.joblib
+         - Supports *.zip including GitHub tag archives (we scan for *.pkl|*.joblib inside)
+    Returns the loaded object, or None if not found.
     """
     base = Path(__file__).resolve().parent
     model_dir = base / "models"
+    model_dir.mkdir(exist_ok=True)
+
+    # --- 1) Local models directory ---
     local_candidates = [
+        model_dir / "activity_rf.pkl",
         model_dir / "activity_rf.joblib",
         model_dir / "activity_rf.zip",
     ]
-
-    # --- 1) Local models directory ---
     for p in local_candidates:
         if p.exists():
             print(f"[_load_activity_model] Using local {p.name}")
-            if p.suffix == ".zip":
+            if p.suffix.lower() == ".zip":
                 with zipfile.ZipFile(p, "r") as zf:
-                    zf.extractall(model_dir)
-                    inner = model_dir / "activity_rf.joblib"
-                    if inner.exists():
-                        return joblib.load(inner)
+                    name, ext = _find_model_in_zipfile(zf)
+                    if not name:
+                        raise RuntimeError("Local activity_rf.zip found, but no *.pkl/*.joblib inside.")
+                    out_path = model_dir / f"activity_rf{ext}"
+                    with zf.open(name) as f:
+                        out_path.write_bytes(f.read())
+                    return _safe_joblib_load(out_path)
             else:
-                return joblib.load(p)
+                return _safe_joblib_load(p)
 
     # --- 2) Cache folder ---
     cache_dir = base / ".cache_models"
     cache_dir.mkdir(exist_ok=True)
-    cache_path = cache_dir / "activity_rf.joblib"
-    if cache_path.exists():
-        print("[_load_activity_model] Using cached model copy")
-        return joblib.load(cache_path)
+    cache_candidates = [
+        cache_dir / "activity_rf.pkl",
+        cache_dir / "activity_rf.joblib",
+    ]
+    for c in cache_candidates:
+        if c.exists():
+            print("[_load_activity_model] Using cached model:", c.name)
+            return _safe_joblib_load(c)
 
-    # --- 3) Streamlit secret or env URL ---
+    # --- 3) URL from Streamlit secrets or env, else DEFAULT_MODEL_URL ---
     url = os.getenv("MODEL_URL")
     if not url:
         try:
-            import streamlit as st
+            import streamlit as st  # will work when running inside Streamlit
             url = st.secrets.get("MODEL_URL")
         except Exception:
             url = None
     if not url:
-        print("[_load_activity_model] No model found locally or remotely.")
+        url = DEFAULT_MODEL_URL
+
+    if not url:
+        print("[_load_activity_model] No model URL provided and no local model. Heuristic fallback will be used.")
         return None
 
-    print(f"[_load_activity_model] Downloading model from {url}")
-    r = requests.get(url, timeout=120)
+    print(f"[_load_activity_model] Downloading model from: {url}")
+    r = requests.get(url, timeout=180, allow_redirects=True)
     r.raise_for_status()
 
-    if url.endswith(".zip"):
-        ztmp = cache_dir / "activity_rf.zip"
+    # If it's a zip (GitHub Release asset or GitHub tag archive)
+    if url.lower().endswith(".zip") or "/archive/refs/tags/" in url.lower():
+        ztmp = cache_dir / "downloaded_archive.zip"
         ztmp.write_bytes(r.content)
         with zipfile.ZipFile(ztmp, "r") as zf:
-            zf.extractall(cache_dir)
-        if cache_path.exists():
-            return joblib.load(cache_path)
-    else:
-        cache_path.write_bytes(r.content)
-        return joblib.load(cache_path)
-    return None
+            name, ext = _find_model_in_zipfile(zf)
+            if not name:
+                raise RuntimeError("Downloaded archive contains no *.pkl or *.joblib. Put the model inside the archive.")
+            out_path = cache_dir / f"activity_rf{ext}"
+            with zf.open(name) as f:
+                out_path.write_bytes(f.read())
+        print(f"[_load_activity_model] Extracted model -> {out_path}")
+        return _safe_joblib_load(out_path)
 
-    # --- fallback: download ---
-    url = os.getenv("MODEL_URL")
-    if not url:
-        try:
-            import streamlit as st
-            url = st.secrets.get("MODEL_URL")
-        except Exception:
-            url = None
-    if not url:
-        print("[_load_activity_model] No local or remote model found.")
-        return None
-
-    cache_dir = base / ".cache_models"
-    cache_dir.mkdir(exist_ok=True)
-    cache_file = cache_dir / "activity_rf.joblib"
-
-    if not cache_file.exists():
-        print(f"[_load_activity_model] Downloading model from {url}")
-        r = requests.get(url, timeout=120)
-        r.raise_for_status()
-        if url.endswith(".zip"):
-            ztmp = cache_dir / "activity_rf.zip"
-            ztmp.write_bytes(r.content)
-            with zipfile.ZipFile(ztmp, "r") as zf:
-                zf.extractall(cache_dir)
-            if cache_file.exists():
-                return joblib.load(cache_file)
-        else:
-            cache_file.write_bytes(r.content)
-    return joblib.load(cache_file) if cache_file.exists() else None
+    # Else assume direct model file (.pkl/.joblib)
+    # Try to infer extension; default to .pkl
+    ext = ".joblib" if url.lower().endswith(".joblib") else ".pkl"
+    cache_path = cache_dir / f"activity_rf{ext}"
+    cache_path.write_bytes(r.content)
+    print(f"[_load_activity_model] Saved model -> {cache_path}")
+    return _safe_joblib_load(cache_path)
 
 # Try to import joblib for loading model (if available)
 try:
@@ -294,7 +320,7 @@ class RunningDetector:
         self.to_idle_frames = max(1, int(round(anti_spike_to_idle_sec * fps)))
         self.between_run_frames = max(1, int(round(anti_spike_between_run_sec * fps)))
 
-        # --- NEW unified model loader ---
+        # --- unified model loader ---
         if HAVE_JOBLIB:
             try:
                 md = _load_activity_model()
@@ -305,9 +331,9 @@ class RunningDetector:
                     self.model = md
                     self.model_labels = []
                 if self.model is None:
-                    print("[RunningDetector] Warning: model empty → heuristic.")
+                    print("[RunningDetector] Warning: model empty → heuristic fallback.")
             except Exception as e:
-                print(f"[RunningDetector] Warning: cannot load model (reason: {e})")
+                print(f"[RunningDetector] Warning: cannot load model (reason: {e}) → heuristic.")
                 self.model = None
         else:
             print("[RunningDetector] joblib not available → heuristic fallback.")
@@ -631,7 +657,6 @@ def build_recommendations(seg_raw, notes=None, posture_counts=None):
         if posture_counts and sum(posture_counts.values()) > 0:
             recs.append("Overall running form looks good – no major issues detected.")
         else:
-            # for realtime partials with zero frames, keep it quiet; caller can omit
             recs.append("No running/jogging segments detected yet.")
     return recs
 
@@ -1069,7 +1094,6 @@ def process_realtime(source=0, output_dir=None, save_video=False, save_csv=False
         recs_so_far = []
         if scorer_snapshot and scorer_snapshot.get("frames_scored", 0) > 0:
             seg_raw_partial = scorer_snapshot.get("segment_raw_partial", {})
-            # inject zeros for keys the partial doesn't have
             seg_raw_for_recs = {
                 "posture": seg_raw_partial.get("posture", 0.0),
                 "shank": seg_raw_partial.get("shank", 0.0),
@@ -1349,5 +1373,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
