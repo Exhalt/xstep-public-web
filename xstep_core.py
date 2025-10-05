@@ -325,8 +325,7 @@ class RunningDetector:
                   self.model_labels = md.get("labels", [])
                else:
                   self.model = md
-                  self.model_labels = []
-                      
+                  self.model_labels = []   
                 if self.model is None:
                     print("[RunningDetector] Warning: model empty → heuristic fallback.")
             except Exception as e:
@@ -1370,4 +1369,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
